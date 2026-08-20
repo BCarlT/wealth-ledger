@@ -109,7 +109,8 @@ input,select{font-family:inherit;font-size:14px}
 .tbl tr:last-child td{border-bottom:0}
 .tbl tbody tr:hover{background:var(--surface-2)}
 .asset{display:flex;align-items:center;gap:11px}
-.asset .ic{width:32px;height:32px;border-radius:8px;flex:none;display:grid;place-items:center;font-weight:700;font-size:11px;color:#fff}
+.asset .ic{position:relative;overflow:hidden;width:32px;height:32px;border-radius:8px;flex:none;display:grid;place-items:center;font-weight:700;font-size:11px;color:#fff}
+.asset .ic img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#fff;padding:2px;transition:opacity .25s}
 .asset .nm{font-weight:600}
 .asset .tk{font-size:12px;color:var(--faint)}
 .ccybadge{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:5px;background:var(--surface-2);color:var(--muted);border:1px solid var(--border);margin-left:6px;vertical-align:middle}
@@ -223,6 +224,7 @@ let liveStatus = ""; // "", busy, on, err
 let ui = { tab:"overview", expMonth: curMonth(), modal:null };
 let saveTimer=null, liveTimer=null, started=false;
 let CG_CACHE={}; // runtime cache: crypto ticker -> resolved CoinGecko id
+let CG_IMG={};   // runtime cache: crypto ticker -> logo URL
 
 function inArtifact(){ return typeof window.claude!=="undefined" && !!window.claude && typeof window.claude.use==="function"; }
 
@@ -251,8 +253,18 @@ function toUSD(amt,c){ return amt/(state.rates[c]||1); }
 function fmt(amt,c){ const m=CCY[c]||CCY.USD; const neg=amt<0; amt=Math.abs(amt);
   return (neg?"−":"")+m.sym+amt.toLocaleString("en-US",{minimumFractionDigits:m.dp,maximumFractionDigits:m.dp}); }
 function fmtD(usd){ return fmt(usd*rate(D()), D()); }
+function fmtNum(n,dec){ if(n==null||n==="")return""; return Number(n).toLocaleString("en-US",{maximumFractionDigits:dec==null?8:dec}); }
+function parseNum(s){ const v=parseFloat(String(s).replace(/[^0-9.\-]/g,"")); return isNaN(v)?0:v; }
 function effShares(h){ return (h.qty||0)*(h.lot||1); }
-function holdingValue(h){ return classOf(h.class).unit ? effShares(h)*(h.price||0) : (h.price||0); }
+// bonds: face value + clean price (% of par) + accrued coupon = dirty (real) value
+function bondCoupon(h){ return (h.face||0)*((h.coupon||0)/100)/(h.freq||2); } // per period, native ccy
+function bondAccrued(h){ if(h.class!=="bond"||!h.coupon||!h.face||!h.lastCoupon) return 0;
+  const last=new Date(h.lastCoupon); if(isNaN(last)) return 0;
+  const periodDays=365/(h.freq||2); let days=(Date.now()-last.getTime())/86400000;
+  if(days<0)days=0; if(days>periodDays)days=periodDays; return bondCoupon(h)*(days/periodDays); }
+function bondClean(h){ return (h.face||0)*((h.price||100)/100); }
+function bondValue(h){ return bondClean(h)+bondAccrued(h); }
+function holdingValue(h){ if(classOf(h.class).unit) return effShares(h)*(h.price||0); if(h.class==="bond") return bondValue(h); return (h.price||0); }
 function holdingUSD(h){ return toUSD(holdingValue(h), h.ccy||"TWD"); }
 function holdingInvested(h){ return (classOf(h.class).unit && h.avg>0) ? effShares(h)*h.avg : null; } // native ccy
 function holdingInvestedUSD(h){ const v=holdingInvested(h); return v==null?null:toUSD(v,h.ccy||"TWD"); }
@@ -304,21 +316,23 @@ async function jget(url){ const c=new AbortController(); const t=setTimeout(()=>
   finally{ clearTimeout(t); } }
 async function fetchFX(){ const j=await jget("https://open.er-api.com/v6/latest/USD");
   if(j&&j.rates&&j.rates.TWD&&j.rates.IDR){ state.rates.TWD=j.rates.TWD; state.rates.IDR=j.rates.IDR; return true; } return false; }
-// resolve ANY crypto ticker -> CoinGecko id (static map first, then live search)
+// resolve ANY crypto ticker -> CoinGecko id (static map first, then live search); also grab logo
 async function resolveCG(ticker){ const t=(ticker||"").toUpperCase(); if(!t) return null;
-  if(CG[t]) return CG[t];
   if(CG_CACHE[t]!==undefined) return CG_CACHE[t];
-  let id=null;
+  let id=CG[t]||null;
   try{ const j=await jget("https://api.coingecko.com/api/v3/search?query="+encodeURIComponent(t));
-    const coins=(j&&j.coins)||[]; if(coins.length){ const exact=coins.find(c=>(c.symbol||"").toUpperCase()===t); id=(exact||coins[0]).id; }
+    const coins=(j&&j.coins)||[]; if(coins.length){ const exact=coins.find(c=>(c.symbol||"").toUpperCase()===t)||(id?coins.find(c=>c.id===id):null)||coins[0];
+      if(!id) id=exact.id; if(exact&&(exact.large||exact.thumb)) CG_IMG[t]=exact.large||exact.thumb; }
   }catch(e){}
   CG_CACHE[t]=id; return id; }
 async function fetchCrypto(){
   const cryptos=state.holdings.filter(h=>h.class==="crypto"&&h.ticker); if(!cryptos.length) return false;
   const map={}; for(const h of cryptos){ const t=h.ticker.toUpperCase(); if(map[t]===undefined) map[t]=await resolveCG(t); }
   const ids=[...new Set(Object.values(map).filter(Boolean))]; if(!ids.length) return false;
-  const j=await jget("https://api.coingecko.com/api/v3/simple/price?ids="+ids.join(",")+"&vs_currencies=usd");
-  let any=false; state.holdings.forEach(h=>{ if(h.class==="crypto"&&h.ticker){ const id=map[h.ticker.toUpperCase()]; if(id&&j[id]&&j[id].usd!=null){ h.price=j[id].usd; h.ccy="USD"; h.live=true; any=true; } } });
+  const j=await jget("https://api.coingecko.com/api/v3/simple/price?ids="+ids.join(",")+"&vs_currencies=usd,idr,twd");
+  let any=false; state.holdings.forEach(h=>{ if(h.class==="crypto"&&h.ticker){ const id=map[h.ticker.toUpperCase()]; const d=id&&j[id];
+    if(d){ const cc=(h.ccy||"USD").toLowerCase(); const px=d[cc]!=null?d[cc]:d.usd; if(px!=null){ h.price=px; h.live=true; any=true; } }
+    const img=CG_IMG[h.ticker.toUpperCase()]; if(img) h.logo=img; } });
   return any; }
 // Map a stock holding to its Yahoo Finance symbol by currency/exchange
 function yahooSymbol(h){ const t=(h.ticker||"").toUpperCase().replace(/\s+/g,""); if(!t) return null;
@@ -442,6 +456,7 @@ function viewOverview(){
       +"<div class=\"networth num\">"+fmt(nwUSD*rate("TWD"),"TWD")+"</div>"
       +"<div class=\"nw-second num\">"+fmt(nwUSD*rate("IDR"),"IDR")+"</div>"
       +"<div class=\"nw-usd num\">≈ "+fmt(nwUSD,"USD")+" USD</div>"
+      +"<div class=\"nw-usd num\" style=\"margin-top:4px;font-weight:500;opacity:.9\">NT$1 = Rp "+fmtNum(rate("IDR")/rate("TWD"),0)+" &nbsp;·&nbsp; $1 = Rp "+fmtNum(rate("IDR"),0)+(inArtifact()?"":" &nbsp;<span style=\"color:var(--gain)\">● live</span>")+"</div>"
       +"<div class=\"nw-sub\"><span class=\"chip "+chipCls+"\">"+chipTxt+"</span><span>"+(hasHist?"since first snapshot":"save a snapshot to track growth")+"</span></div>"
       +"<canvas id=\"spark\" class=\"spark\"></canvas>"
     +"</div>"
@@ -488,17 +503,30 @@ function viewHoldings(){
     const clsPnl=clsHasInv?subUSD-clsInv:null;
     html+="<div class=\"class-h\"><span class=\"bar\" style=\"background:var("+c.v+")\"></span>"+c.label+" · "+fmtD(subUSD)
       +(clsPnl!=null?" <span style=\"font-family:'Public Sans';font-size:12px;color:"+(clsPnl>=0?"var(--gain)":"var(--loss)")+"\">"+(clsPnl>=0?"▲ +":"▼ −")+fmtD(Math.abs(clsPnl))+"</span>":"")+"</div>";
-    if(c.unit){
+    const ro=readOnly?"disabled":"";
+    if(c.k==="bond"){
+      html+="<table class=\"tbl\"><thead><tr><th>Asset</th><th class=\"r\">Face value</th><th class=\"r\">Price</th><th class=\"r\">Coupon</th><th class=\"r\">Value ("+sym+")</th>"+(readOnly?"":"<th></th>")+"</tr></thead><tbody>";
+      rows.forEach(h=>{ const dispUSD=holdingUSD(h), accr=bondAccrued(h);
+        const native=h.ccy!==D()?"<div class=\"subval num\">"+fmt(holdingValue(h),h.ccy)+"</div>":"";
+        const accrLine=accr>0?"<div class=\"subval\">incl. "+fmt(accr,h.ccy)+" accrued</div>":"";
+        html+="<tr><td>"+assetCell(h,c)+"</td>"
+          +"<td class=\"r\"><input class=\"price-edit num\" data-id=\""+h.id+"\" data-field=\"face\" value=\""+fmtNum(h.face,2)+"\" placeholder=\"—\" "+ro+"></td>"
+          +"<td class=\"r\"><input class=\"price-edit num\" style=\"width:74px\" data-id=\""+h.id+"\" data-field=\"price\" value=\""+fmtNum(h.price==null?100:h.price,3)+"\" "+ro+"></td>"
+          +"<td class=\"r num\" style=\"color:var(--muted)\">"+(h.coupon?fmtNum(h.coupon,3)+"%<div class=\"subval\">"+((h.freq||2)===1?"annual":"semiannual")+"</div>":"—")+"</td>"
+          +"<td class=\"r num\" style=\"font-weight:600\">"+fmtD(dispUSD)+native+accrLine+"</td>"
+          +(readOnly?"":"<td class=\"r\"><button class=\"rowbtn del\" data-id=\""+h.id+"\">✕</button></td>")+"</tr>"; });
+      html+="</tbody></table>";
+    } else if(c.unit){
       html+="<table class=\"tbl\"><thead><tr><th>Asset</th><th class=\"r\">Qty</th><th class=\"r\">Avg cost</th><th class=\"r\">Last price</th><th class=\"r\">Value ("+sym+")</th><th class=\"r\">P&L</th>"+(readOnly?"":"<th></th>")+"</tr></thead><tbody>";
       rows.forEach(h=>{ const dispUSD=holdingUSD(h), native=h.ccy!==D()?"<div class=\"subval num\">"+fmt(holdingValue(h),h.ccy)+"</div>":"";
-        const ql=h.class==="stock"?((h.qty||0)+(h.lot===100?" lot":" sh")):(h.qty||0)+"";
+        const ql=h.class==="stock"?(fmtNum(h.qty,8)+(h.lot===100?" lot":" sh")):fmtNum(h.qty,8);
         const pnl=holdingPnlUSD(h), invUSD=holdingInvestedUSD(h), pct=invUSD?pnl/invUSD*100:0;
         const pnlCell = pnl==null ? "<span style=\"color:var(--faint)\">—</span>"
           : "<span style=\"color:"+(pnl>=0?"var(--gain)":"var(--loss)")+";font-weight:600\">"+(pnl>=0?"+":"−")+fmtD(Math.abs(pnl))+"</span><div class=\"subval\" style=\"color:"+(pnl>=0?"var(--gain)":"var(--loss)")+"\">"+(pnl>=0?"+":"−")+Math.abs(pct).toFixed(1)+"%</div>";
         html+="<tr><td>"+assetCell(h,c)+"</td>"
           +"<td class=\"r num\">"+ql+"</td>"
-          +"<td class=\"r\"><input class=\"price-edit num\" data-id=\""+h.id+"\" data-field=\"avg\" value=\""+(h.avg||"")+"\" placeholder=\"—\" "+(readOnly?"disabled":"")+"></td>"
-          +"<td class=\"r\"><input class=\"price-edit num\" data-id=\""+h.id+"\" data-field=\"price\" value=\""+(h.price||0)+"\" "+(readOnly?"disabled":"")+"></td>"
+          +"<td class=\"r\"><input class=\"price-edit num\" data-id=\""+h.id+"\" data-field=\"avg\" value=\""+fmtNum(h.avg,8)+"\" placeholder=\"—\" "+ro+"></td>"
+          +"<td class=\"r\"><input class=\"price-edit num\" data-id=\""+h.id+"\" data-field=\"price\" value=\""+fmtNum(h.price,8)+"\" "+ro+"></td>"
           +"<td class=\"r num\" style=\"font-weight:600\">"+fmtD(dispUSD)+native+"</td>"
           +"<td class=\"r num\">"+pnlCell+"</td>"
           +(readOnly?"":"<td class=\"r\"><button class=\"rowbtn del\" data-id=\""+h.id+"\">✕</button></td>")+"</tr>"; });
@@ -507,7 +535,7 @@ function viewHoldings(){
       html+="<table class=\"tbl\"><thead><tr><th>Asset</th><th class=\"r\">Amount</th><th class=\"r\">Value ("+sym+")</th><th class=\"r\">Weight</th>"+(readOnly?"":"<th></th>")+"</tr></thead><tbody>";
       rows.forEach(h=>{ const dispUSD=holdingUSD(h), native=h.ccy!==D()?"<div class=\"subval num\">"+fmt(holdingValue(h),h.ccy)+"</div>":"";
         html+="<tr><td>"+assetCell(h,c)+"</td>"
-          +"<td class=\"r\"><input class=\"price-edit num\" data-id=\""+h.id+"\" data-field=\"price\" value=\""+(h.price||0)+"\" "+(readOnly?"disabled":"")+"></td>"
+          +"<td class=\"r\"><input class=\"price-edit num\" data-id=\""+h.id+"\" data-field=\"price\" value=\""+fmtNum(h.price,2)+"\" "+ro+"></td>"
           +"<td class=\"r num\" style=\"font-weight:600\">"+fmtD(dispUSD)+native+"</td>"
           +"<td class=\"r num\" style=\"color:var(--muted)\">"+(nwUSD?(dispUSD/nwUSD*100).toFixed(1):"0.0")+"%</td>"
           +(readOnly?"":"<td class=\"r\"><button class=\"rowbtn del\" data-id=\""+h.id+"\">✕</button></td>")+"</tr>"; });
@@ -518,9 +546,15 @@ function viewHoldings(){
   return html;
 }
 function ccySelect(id,sel){ return "<select class=\"inp\" id=\""+id+"\">"+["TWD","IDR","USD"].map(c=>"<option value=\""+c+"\" "+(c===sel?"selected":"")+">"+CCY[c].sym.trim()+" "+c+"</option>").join("")+"</select>"; }
-function assetCell(h,c){ const col=cvar(c.v), init=(h.ticker||h.name||"?").slice(0,3).toUpperCase();
-  const sub=[h.ticker,h.platform].filter(Boolean).join(" · ");
-  return "<div class=\"asset\"><span class=\"ic\" style=\"background:"+col+"\">"+esc(init)+"</span><span><span class=\"nm\">"+esc(h.name||h.ticker||"—")+"</span><span class=\"ccybadge\">"+h.ccy+"</span>"+(h.live?"<span class=\"livedot\" title=\"auto-priced\"></span>":"")+(sub?"<br><span class=\"tk\">"+esc(sub)+"</span>":"")+"</span></div>"; }
+function iconHTML(h,c){ const col=cvar(c.v), init=esc((h.ticker||h.name||"?").slice(0,3).toUpperCase());
+  let logo=null;
+  if(!inArtifact()){ // external images are blocked inside the Claude sandbox; show monogram there
+    if(h.class==="crypto"&&h.logo) logo=h.logo;
+    else if(h.class==="stock"&&h.ticker) logo="https://assets.parqet.com/logos/symbol/"+encodeURIComponent((h.ticker||"").toUpperCase())+"?format=png&size=64";
+  }
+  return "<span class=\"ic\" style=\"background:"+col+"\">"+init+(logo?"<img src=\""+esc(logo)+"\" alt=\"\" loading=\"lazy\" style=\"opacity:0\" onload=\"this.style.opacity=1\" onerror=\"this.remove()\">":"")+"</span>"; }
+function assetCell(h,c){ const sub=[h.ticker,h.platform].filter(Boolean).join(" · ");
+  return "<div class=\"asset\">"+iconHTML(h,c)+"<span><span class=\"nm\">"+esc(h.name||h.ticker||"—")+"</span><span class=\"ccybadge\">"+h.ccy+"</span>"+(h.live?"<span class=\"livedot\" title=\"auto-priced\"></span>":"")+(sub?"<br><span class=\"tk\">"+esc(sub)+"</span>":"")+"</span></div>"; }
 function addHoldingCard(){
   return "<div class=\"card pad\"><form id=\"holdForm\"><div class=\"seg\" id=\"hClass\" style=\"margin-bottom:16px\">"
     +CLASSES.map((c,i)=>"<button type=\"button\" data-c=\""+c.k+"\" class=\""+(i===0?"on":"")+"\">"+c.label+"</button>").join("")
@@ -538,9 +572,15 @@ function holdFields(cls){ const c=classOf(cls);
     +"<div style=\"display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-top:12px;align-items:end\">"
     +fieldNum("Quantity","hQty","0.5")+fieldNum("Avg cost","hAvg","0.00")+fieldNum("Last price","hPrice","0.00")
     +"<div class=\"field\"><label>Currency</label>"+ccySelect("hCcy",c.dccy)+"</div></div>";
+  if(cls==="bond") return "<div style=\"display:grid;grid-template-columns:1.5fr 1fr .9fr;gap:12px\">"
+    +field("Name","hName","Gov’t / corporate bond")+field("Platform","hPlat","Broker")+"<div class=\"field\"><label>Currency</label>"+ccySelect("hCcy",c.dccy)+"</div></div>"
+    +"<div style=\"display:grid;grid-template-columns:1.1fr .8fr .9fr .95fr 1fr;gap:12px;margin-top:12px;align-items:end\">"
+    +fieldNum("Face value","hFace","10000000")+fieldNum("Price (% par)","hPrice","100")+fieldNum("Coupon % p.a.","hCoupon","6.5")
+    +"<div class=\"field\"><label>Coupon freq</label><select class=\"inp\" id=\"hFreq\"><option value=\"2\">Semiannual</option><option value=\"1\">Annual</option></select></div>"
+    +"<div class=\"field\"><label>Last coupon</label><input class=\"inp num\" id=\"hLast\" type=\"date\"></div></div>";
   return "<div style=\"display:grid;grid-template-columns:1.4fr .9fr .8fr 1fr;gap:12px;align-items:end\">"
-    +field("Name","hName",cls==="bond"?"Gov’t bond":"Bank savings")+fieldNum("Amount","hPrice","0.00")
-    +"<div class=\"field\"><label>Currency</label>"+ccySelect("hCcy",c.dccy)+"</div>"+field("Platform","hPlat",cls==="bond"?"Broker":"Bank name")+"</div>";
+    +field("Name","hName","Bank savings")+fieldNum("Amount","hPrice","0.00")
+    +"<div class=\"field\"><label>Currency</label>"+ccySelect("hCcy",c.dccy)+"</div>"+field("Platform","hPlat","Bank name")+"</div>";
 }
 function field(l,id,ph){ return "<div class=\"field\"><label>"+l+"</label><input class=\"inp\" id=\""+id+"\" placeholder=\""+esc(ph)+"\"></div>"; }
 function fieldNum(l,id,ph){ return "<div class=\"field\"><label>"+l+"</label><input class=\"inp num\" id=\""+id+"\" type=\"number\" step=\"any\" placeholder=\""+esc(ph)+"\"></div>"; }
@@ -645,8 +685,8 @@ function bind(){
     const im=$("#mImport"), mf=$("#mFile"); if(im&&mf){ im.onclick=()=>mf.click(); mf.onchange=()=>{ if(mf.files[0]) importData(mf.files[0]); }; }
   }
 
-  document.querySelectorAll(".price-edit").forEach(inp=>{ const commit=()=>{ const raw=inp.value.trim(); const v=raw===""?0:(parseFloat(raw)||0); const h=state.holdings.find(x=>x.id===inp.dataset.id); if(!h)return; const f=inp.dataset.field||"price";
-      if(h[f]!==v){ h[f]=v; if(f==="price"){ h.live=false; if(classOf(h.class).unit)state.pricesUpdatedAt=new Date().toISOString(); } persist(); render(); } };
+  document.querySelectorAll(".price-edit").forEach(inp=>{ const commit=()=>{ const raw=inp.value.trim(); const v=raw===""?0:parseNum(raw); const h=state.holdings.find(x=>x.id===inp.dataset.id); if(!h)return; const f=inp.dataset.field||"price";
+      if(h[f]!==v){ h[f]=v; if(f==="price"&&h.class!=="bond"){ h.live=false; } if(f==="price"&&classOf(h.class).unit)state.pricesUpdatedAt=new Date().toISOString(); persist(); render(); } };
     inp.addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();inp.blur();}}); inp.addEventListener("blur",commit); });
   document.querySelectorAll(".rowbtn.del").forEach(b=>b.onclick=()=>delHolding(b.dataset.id));
   document.querySelectorAll(".del-exp").forEach(b=>b.onclick=()=>delExpense(b.dataset.id));
@@ -655,10 +695,12 @@ function bind(){
   const hf=$("#holdForm");
   if(hf){ let cls="stock"; const box=$("#hFields"); box.innerHTML=holdFields(cls);
     document.querySelectorAll("#hClass button").forEach(b=>b.onclick=()=>{ document.querySelectorAll("#hClass button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); cls=b.dataset.c; box.innerHTML=holdFields(cls); });
-    hf.onsubmit=e=>{ e.preventDefault(); const c=classOf(cls); const name=(($("#hName")||{}).value||"").trim(); const price=parseFloat(($("#hPrice")||{}).value)||0; const ccy=($("#hCcy")||{}).value||"TWD"; const plat=(($("#hPlat")||{}).value||"").trim();
-      if(c.unit){ const qty=parseFloat(($("#hQty")||{}).value)||0; const tk=(($("#hTicker")||{}).value||"").trim(); const av=parseFloat(($("#hAvg")||{}).value); const lot=parseInt(($("#hUnit")||{}).value)||1;
+    hf.onsubmit=e=>{ e.preventDefault(); const c=classOf(cls); const name=(($("#hName")||{}).value||"").trim(); const ccy=($("#hCcy")||{}).value||"TWD"; const plat=(($("#hPlat")||{}).value||"").trim();
+      if(c.unit){ const price=parseNum(($("#hPrice")||{}).value); const qty=parseNum(($("#hQty")||{}).value); const tk=(($("#hTicker")||{}).value||"").trim(); const av=parseNum(($("#hAvg")||{}).value); const lot=parseInt(($("#hUnit")||{}).value)||1;
         if(!name&&!tk){flash($("#hName"));return;} addHolding({class:cls,name:name||tk,ticker:tk.toUpperCase(),qty:qty,price:price,ccy:ccy,platform:plat,avg:av>0?av:undefined,lot:lot}); }
-      else { if(!name){flash($("#hName"));return;} addHolding({class:cls,name:name,ticker:"",qty:1,price:price,ccy:ccy,platform:plat}); } };
+      else if(cls==="bond"){ const face=parseNum(($("#hFace")||{}).value); const cp=parseNum(($("#hPrice")||{}).value)||100; const coupon=parseNum(($("#hCoupon")||{}).value); const freq=parseInt(($("#hFreq")||{}).value)||2; const last=($("#hLast")||{}).value||"";
+        if(!name){flash($("#hName"));return;} if(!face){flash($("#hFace"));return;} addHolding({class:"bond",name:name,ticker:"",ccy:ccy,platform:plat,face:face,price:cp,coupon:coupon>0?coupon:undefined,freq:freq,lastCoupon:last}); }
+      else { const price=parseNum(($("#hPrice")||{}).value); if(!name){flash($("#hName"));return;} addHolding({class:cls,name:name,ticker:"",qty:1,price:price,ccy:ccy,platform:plat}); } };
   }
   const inf=$("#incForm");
   if(inf) inf.onsubmit=e=>{ e.preventDefault(); const a=parseFloat($("#iAmt").value)||0; if(a<=0){flash($("#iAmt"));return;} addIncome({amount:a,ccy:$("#iCcy").value,date:$("#iDate").value||new Date().toISOString().slice(0,10),source:$("#iSrc").value,note:$("#iNote").value.trim()}); };
